@@ -47,11 +47,12 @@
  *
  * Plugin that handles encryption of opus data so it can be played on a Discord bot
  * https://discordapp.com/developers/docs/topics/voice-connections#establishing-a-voice-udp-connection 
- *
+ * Note: opusenc frame-size should almost always be set to 60. 20 (default) causes much higher cpu usage.
+ * 
  * <refsect2>
  * <title>Example of playback with ssrc and key being obtained from Discord</title>
  * |[
- * gst-launch-1.0 -v audiotestsrc num-buffers=20 ! audioconvert ! audioresample ! opusenc ! \
+ * gst-launch-1.0 -v audiotestsrc num-buffers=20 ! audioconvert ! audioresample ! opusenc frame-size=60 ! \
  * rtpopuspay pt=120 ssrc=x ! discordcrypto encryption=xsalsa20_poly1305_lite "key=<x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x>" ! udpsink host=127.0.0.1 port=1234
  * ]|
  * </refsect2>
@@ -84,11 +85,6 @@ enum
   PROP_KEY
 };
 
-/* the capabilities of the inputs and outputs.
- *
- * only accepts opus rtp packets and supplys the same packet 
-   with the data encrypted for used with discord
- */
 static GstStaticPadTemplate sink_factory = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
@@ -147,9 +143,6 @@ gst_discord_crypto_pattern_get_type (void)
   return discord_crypto_pattern_type;
 }
 
-/* GObject vmethod implementations */
-
-/* initialize the discordcrypto's class */
 static void
 gst_discord_crypto_class_init (GstDiscordcryptoClass * klass)
 {
@@ -197,11 +190,6 @@ gst_discord_crypto_class_init (GstDiscordcryptoClass * klass)
       GST_DEBUG_FUNCPTR (gst_discord_crypto_stop);
 }
 
-/* initialize the new element
- * instantiate pads and add them to element
- * set pad calback functions
- * initialize instance structure
- */
 static void
 gst_discord_crypto_init (GstDiscordcrypto * filter)
 {
@@ -273,9 +261,6 @@ gst_discord_crypto_get_property (GObject * object, guint prop_id,
   g_value_unset(&val);
 }
 
-/* GstElement vmethod implementations */
-
-/* this function handles sink events */
 static gboolean
 gst_discord_crypto_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
 {
@@ -288,7 +273,6 @@ gst_discord_crypto_sink_event (GstPad * pad, GstObject * parent, GstEvent * even
   return ret;
 }
 
-/* GstBaseTransform vmethod implementations */
 static GstFlowReturn
 gst_discord_crypto_transform (GstBaseTransform * base, GstBuffer *inbuf, GstBuffer *outbuf)
 {
@@ -411,17 +395,9 @@ gst_discord_crypto_stop (GstBaseTransform * base)
   return TRUE;
 }
 
-/* entry point to initialize the plug-in
- * initialize the plug-in itself
- * register the element factories and other features
- */
 static gboolean
 discordcrypto_init (GstPlugin * discordcrypto)
 {
-  /* debug category for fltering log messages
-   *
-   * exchange the string 'Template discordcrypto' with your description
-   */
   GST_DEBUG_CATEGORY_INIT (gst_discord_crypto_debug, "discordcrypto",
       0, "discordcrypto");
 
@@ -429,19 +405,10 @@ discordcrypto_init (GstPlugin * discordcrypto)
       GST_TYPE_DISCORDCRYPTO);
 }
 
-/* PACKAGE: this is usually set by autotools depending on some _INIT macro
- * in configure.ac and then written into and defined in config.h, but we can
- * just set it ourselves here in case someone doesn't use autotools to
- * compile this code. GST_PLUGIN_DEFINE needs PACKAGE to be defined.
- */
 #ifndef PACKAGE
 #define PACKAGE "discordcrypto"
 #endif
 
-/* gstreamer looks for this structure to register discordcryptos
- *
- * exchange the string 'Template discordcrypto' with your discordcrypto description
- */
 GST_PLUGIN_DEFINE (
     GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
