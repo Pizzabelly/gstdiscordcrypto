@@ -114,10 +114,13 @@ static void gst_discord_crypto_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
 static void gst_discord_crypto_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
-static GstFlowReturn gst_discord_crypto_transform (GstBaseTransform * base, 
-    GstBuffer *inbuf, GstBuffer *outbuf);
+static GstFlowReturn gst_discord_crypto_transform_ip (GstBaseTransform * base, GstBuffer *buf);
+
+/*
 static GstFlowReturn gst_discord_crypto_prepare_output_buffer (GstBaseTransform * base,
     GstBuffer * inbuf, GstBuffer ** outbuf);
+*/
+
 static gboolean gst_discord_crypto_start (GstBaseTransform * base);
 static gboolean gst_discord_crypto_stop (GstBaseTransform * base);
 static gboolean gst_discord_crypto_sink_event (GstPad * pad, GstObject * parent, GstEvent * event);
@@ -177,11 +180,8 @@ gst_discord_crypto_class_init (GstDiscordcryptoClass * klass)
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&sink_factory));
 
-  GST_BASE_TRANSFORM_CLASS (klass)->transform =
-      GST_DEBUG_FUNCPTR (gst_discord_crypto_transform);
-
-  GST_BASE_TRANSFORM_CLASS (klass)->prepare_output_buffer =
-      GST_DEBUG_FUNCPTR (gst_discord_crypto_prepare_output_buffer);
+  GST_BASE_TRANSFORM_CLASS (klass)->transform_ip =
+      GST_DEBUG_FUNCPTR (gst_discord_crypto_transform_ip);
 
   GST_BASE_TRANSFORM_CLASS (klass)->start =
       GST_DEBUG_FUNCPTR (gst_discord_crypto_start);
@@ -274,17 +274,14 @@ gst_discord_crypto_sink_event (GstPad * pad, GstObject * parent, GstEvent * even
 }
 
 static GstFlowReturn
-gst_discord_crypto_transform (GstBaseTransform * base, GstBuffer *inbuf, GstBuffer *outbuf)
+gst_discord_crypto_transform_ip (GstBaseTransform * base, GstBuffer *buf)
 {
   GstDiscordcrypto *filter = GST_DISCORDCRYPTO (base);
 
   GstClockTime timestamp, stream_time;
-  GstMapInfo inmap, outmap;
+  GstMapInfo map;
 
-  gst_buffer_map (inbuf, &inmap, GST_MAP_READ);
-  gst_buffer_map (outbuf, &outmap, GST_MAP_READWRITE);
-
-  timestamp = GST_BUFFER_TIMESTAMP (inbuf);
+  timestamp = GST_BUFFER_TIMESTAMP (buf);
   stream_time =
       gst_segment_to_stream_time (&base->segment, GST_FORMAT_TIME, timestamp);
 
@@ -294,77 +291,62 @@ gst_discord_crypto_transform (GstBaseTransform * base, GstBuffer *inbuf, GstBuff
   if (GST_CLOCK_TIME_IS_VALID (stream_time))
     gst_object_sync_values (GST_OBJECT (filter), stream_time);
 
-  if (!inmap.data || !outmap.data)
-    return GST_FLOW_ERROR;
+  gsize size = gst_buffer_get_size(buf);
 
-  memcpy(outmap.data, inmap.data, RTP_HEADER_SIZE);
+  switch (filter->encryption) {
+    case GST_DISCORDCRYPTO_XSALSA20_POLY1305: {
+      filter->outsize = size + crypto_secretbox_MACBYTES;
+      gst_buffer_set_size(buf, filter->outsize);
+      break;
+    }
+    case GST_DISCORDCRYPTO_XSALSA20_POLY1305_SUFFIX: {
+      filter->outsize = size + crypto_secretbox_MACBYTES + crypto_secretbox_NONCEBYTES;
+      gst_buffer_set_size(buf, filter->outsize);
+      break;
+    }
+    case GST_DISCORDCRYPTO_XSALSA20_POLY1305_LITE: {
+      filter->outsize = size + crypto_secretbox_MACBYTES + 4;
+      gst_buffer_set_size(buf, filter->outsize);
+      break;
+    }
+  }
+
+  gst_buffer_map (buf, &map, GST_MAP_READWRITE);
+
+  if (!map.data)
+    return GST_FLOW_ERROR;
 
   guint8 nonce[24] = {0};
 
-  guint8 *out_data  = outmap.data + RTP_HEADER_SIZE;
-  guint8 *in_data   = inmap.data  + RTP_HEADER_SIZE;
-  gsize  data_size  = inmap.size  - RTP_HEADER_SIZE;
+  guint8 *data   = map.data + RTP_HEADER_SIZE;
+  gsize  data_size  = size - RTP_HEADER_SIZE;
 
   switch (filter->encryption) {
-    case GST_DISCORDCRYPTO_XSALSA20_POLY1305:
-      memcpy(nonce, inmap.data, RTP_HEADER_SIZE);
-      crypto_secretbox_easy(out_data, in_data, data_size, nonce, filter->key);
+    case GST_DISCORDCRYPTO_XSALSA20_POLY1305: {
+      memcpy(nonce, map.data, RTP_HEADER_SIZE);
+      crypto_secretbox_easy(data, data, data_size, nonce, filter->key);
       break;
-    case GST_DISCORDCRYPTO_XSALSA20_POLY1305_SUFFIX:
+    }
+    case GST_DISCORDCRYPTO_XSALSA20_POLY1305_SUFFIX: {
       randombytes_buf(nonce, sizeof nonce);
-      crypto_secretbox_easy(out_data, in_data, data_size, nonce, filter->key);
-      memcpy(outmap.data + (filter->outsize - 24), nonce, 24); 
+      crypto_secretbox_easy(data, data, data_size, nonce, filter->key);
+      memcpy(map.data + (filter->outsize - 24), nonce, 24); 
       break;
-    case GST_DISCORDCRYPTO_XSALSA20_POLY1305_LITE:
+    }
+    case GST_DISCORDCRYPTO_XSALSA20_POLY1305_LITE: {
       ((guint32 *)&nonce[0])[0] = g_htonl(filter->lite_nonce);
       if (filter->lite_nonce < 4294967295) {
         filter->lite_nonce++;
       } else {
         filter->lite_nonce = 0;
       }
-      crypto_secretbox_easy(out_data, in_data, data_size, nonce, filter->key);
-      memcpy(outmap.data + (filter->outsize - 4), &((guint32 *)&nonce[0])[0], 4);
+      crypto_secretbox_easy(data, data, data_size, nonce, filter->key);
+      memcpy(map.data + (filter->outsize - 4), &((guint32 *)&nonce[0])[0], 4);
       break;
+    }
   }
 
-  gst_buffer_unmap (inbuf, &inmap);
-  gst_buffer_unmap (outbuf, &outmap);
-
-  return GST_FLOW_OK;
-}
-
-static GstFlowReturn
-gst_discord_crypto_prepare_output_buffer (GstBaseTransform * base,
-    GstBuffer * inbuf, GstBuffer ** outbuf)
-{
-  GstDiscordcrypto *filter = GST_DISCORDCRYPTO (base);
-
-  GstClockTime pts, dts, duration;
-
-  pts = GST_BUFFER_PTS (inbuf);
-  dts = GST_BUFFER_DTS (inbuf);
-  duration = GST_BUFFER_DURATION (inbuf);
-  
-  gsize in_size = gst_buffer_get_size(inbuf);
-
-  switch (filter->encryption) {
-    case GST_DISCORDCRYPTO_XSALSA20_POLY1305:
-      filter->outsize = in_size + crypto_secretbox_MACBYTES;
-      break;
-    case GST_DISCORDCRYPTO_XSALSA20_POLY1305_SUFFIX:
-      filter->outsize = in_size + crypto_secretbox_MACBYTES + crypto_secretbox_NONCEBYTES;
-      break;
-    case GST_DISCORDCRYPTO_XSALSA20_POLY1305_LITE:
-      filter->outsize = in_size + crypto_secretbox_MACBYTES + 4;
-      break;
-  }
-
-  *outbuf = gst_buffer_new_allocate(NULL, filter->outsize, NULL);
-  *outbuf = gst_buffer_make_writable (*outbuf);
-
-  GST_BUFFER_PTS (*outbuf) = pts;
-  GST_BUFFER_DTS (*outbuf) = dts;
-  GST_BUFFER_DURATION (*outbuf) = duration;
+  gst_buffer_unmap (buf, &map);
 
   return GST_FLOW_OK;
 }
