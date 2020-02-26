@@ -7,7 +7,7 @@ all: obj lib
 debug: CFLAGS += -DDEBUG -g
 debug: executable
 
-all: LDFLAGS  = -lgstbase-1.0 -lgstrtp-1.0 -lsodium
+all: LDFLAGS  = -lgstbase-1.0 -lsodium
 
 obj: gstdiscordcrypto.c
 	$(CC) $(CFLAGS) -c -fpic gstdiscordcrypto.c
