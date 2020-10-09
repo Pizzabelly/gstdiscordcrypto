@@ -80,11 +80,9 @@ struct _GstDiscordcrypto
 
   GstPad *sinkpad, *srcpad;
 
-  gsize outsize;
-  guint lite_nonce;
-
   GstDiscordcryptoPattern encryption;
 
+  guint lite_nonce;
   guint8 key[32];
 };
 

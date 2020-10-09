@@ -53,11 +53,14 @@
  * <title>Example of playback with ssrc and key being obtained from Discord</title>
  * |[
  * gst-launch-1.0 -v audiotestsrc num-buffers=20 ! audioconvert ! audioresample ! opusenc frame-size=60 ! \
- * rtpopuspay pt=120 ssrc=x ! discordcrypto encryption=xsalsa20_poly1305_lite "key=<x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x>" ! udpsink host=127.0.0.1 port=1234
+ *   rtpopuspay pt=120 ssrc=x ! discordcrypto encryption=xsalsa20_poly1305_lite \
+ *   "key=<x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x>" ! \
+ *   udpsink host=127.0.0.1 port=1234
  * ]|
  * </refsect2>
  */
 
+#include "gst/gstevent.h"
 #ifdef HAVE_CONFIG_H
 #  include <config.h>
 #endif
@@ -116,11 +119,6 @@ static void gst_discord_crypto_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
 static GstFlowReturn gst_discord_crypto_transform_ip (GstBaseTransform * base, GstBuffer *buf);
 
-/*
-static GstFlowReturn gst_discord_crypto_prepare_output_buffer (GstBaseTransform * base,
-    GstBuffer * inbuf, GstBuffer ** outbuf);
-*/
-
 static gboolean gst_discord_crypto_start (GstBaseTransform * base);
 static gboolean gst_discord_crypto_stop (GstBaseTransform * base);
 static gboolean gst_discord_crypto_sink_event (GstPad * pad, GstObject * parent, GstEvent * event);
@@ -165,7 +163,7 @@ gst_discord_crypto_class_init (GstDiscordcryptoClass * klass)
   g_object_class_install_property(gobject_class, PROP_KEY,
       gst_param_spec_array("key", "Key", "secret key from discord",
          g_param_spec_uint("value", "val", "val", 0, 255, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS),
-         G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+         G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_LAX_VALIDATION));
 
 
   gst_element_class_set_details_simple(gstelement_class,
@@ -203,8 +201,6 @@ gst_discord_crypto_init (GstDiscordcrypto * filter)
   filter->srcpad = gst_pad_new_from_static_template (&src_factory, NULL);
   GST_PAD_SET_PROXY_CAPS (filter->srcpad);
   gst_element_add_pad (GST_ELEMENT (filter), filter->srcpad);
-
-  filter->lite_nonce = 0;
 }
 
 static void
@@ -227,6 +223,8 @@ gst_discord_crypto_set_property (GObject * object, guint prop_id,
         const GValue *val = gst_value_array_get_value(value, i);
         filter->key[i] = g_value_get_uint(val);
       }
+      // if the key changes this needs to be reset
+      filter->lite_nonce = 0;
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -264,8 +262,14 @@ gst_discord_crypto_get_property (GObject * object, guint prop_id,
 static gboolean
 gst_discord_crypto_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
 {
+  GstDiscordcrypto *filter = GST_DISCORDCRYPTO (parent);
+
   gboolean ret;
   switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_EOS:
+      ret = gst_pad_push_event (GST_BASE_TRANSFORM (filter)->srcpad, event);
+      break;
+
     default:
       ret = gst_pad_event_default (pad, parent, event);
       break;
@@ -292,34 +296,33 @@ gst_discord_crypto_transform_ip (GstBaseTransform * base, GstBuffer *buf)
     gst_object_sync_values (GST_OBJECT (filter), stream_time);
 
   gsize size = gst_buffer_get_size(buf);
+  gsize out_size = size;
 
   switch (filter->encryption) {
     case GST_DISCORDCRYPTO_XSALSA20_POLY1305: {
-      filter->outsize = size + crypto_secretbox_MACBYTES;
-      gst_buffer_set_size(buf, filter->outsize);
+      out_size += crypto_secretbox_MACBYTES;
       break;
     }
     case GST_DISCORDCRYPTO_XSALSA20_POLY1305_SUFFIX: {
-      filter->outsize = size + crypto_secretbox_MACBYTES + crypto_secretbox_NONCEBYTES;
-      gst_buffer_set_size(buf, filter->outsize);
+      out_size += crypto_secretbox_MACBYTES + crypto_secretbox_NONCEBYTES;
       break;
     }
     case GST_DISCORDCRYPTO_XSALSA20_POLY1305_LITE: {
-      filter->outsize = size + crypto_secretbox_MACBYTES + 4;
-      gst_buffer_set_size(buf, filter->outsize);
+      out_size += crypto_secretbox_MACBYTES + 4;
       break;
     }
   }
 
-  gst_buffer_map (buf, &map, GST_MAP_READWRITE);
+  gst_buffer_set_size(buf, out_size);
+  gst_buffer_map(buf, &map, GST_MAP_READWRITE);
 
   if (!map.data)
     return GST_FLOW_ERROR;
 
   guint8 nonce[24] = {0};
 
-  guint8 *data   = map.data + RTP_HEADER_SIZE;
-  gsize  data_size  = size - RTP_HEADER_SIZE;
+  guint8 *data = map.data + RTP_HEADER_SIZE;
+  gsize data_size = size - RTP_HEADER_SIZE;
 
   switch (filter->encryption) {
     case GST_DISCORDCRYPTO_XSALSA20_POLY1305: {
@@ -330,7 +333,7 @@ gst_discord_crypto_transform_ip (GstBaseTransform * base, GstBuffer *buf)
     case GST_DISCORDCRYPTO_XSALSA20_POLY1305_SUFFIX: {
       randombytes_buf(nonce, sizeof nonce);
       crypto_secretbox_easy(data, data, data_size, nonce, filter->key);
-      memcpy(map.data + (filter->outsize - 24), nonce, 24); 
+      memcpy(map.data + (out_size - 24), nonce, 24);
       break;
     }
     case GST_DISCORDCRYPTO_XSALSA20_POLY1305_LITE: {
@@ -341,7 +344,7 @@ gst_discord_crypto_transform_ip (GstBaseTransform * base, GstBuffer *buf)
         filter->lite_nonce = 0;
       }
       crypto_secretbox_easy(data, data, data_size, nonce, filter->key);
-      memcpy(map.data + (filter->outsize - 4), &((guint32 *)&nonce[0])[0], 4);
+      memcpy(map.data + (out_size - 4), &((guint32 *)&nonce[0])[0], 4);
       break;
     }
   }
